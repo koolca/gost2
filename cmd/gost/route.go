@@ -209,6 +209,8 @@ func parseChainNode(ns string) (nodes []gost.Node, err error) {
 		config := &gost.QUICConfig{
 			TLSConfig:   tlsCfg,
 			KeepAlive:   node.GetBool("keepalive"),
+			TCP:         node.GetBool("tcp"),
+			DPMTUD:      node.GetBool("mtu"),
 			Timeout:     timeout,
 			IdleTimeout: node.GetDuration("idle"),
 
@@ -488,6 +490,8 @@ func (r *route) GenRouters() ([]router, error) {
 			config := &gost.QUICConfig{
 				TLSConfig:   tlsCfg,
 				KeepAlive:   node.GetBool("keepalive"),
+				TCP:         node.GetBool("tcp"),
+			    DPMTUD:      node.GetBool("mtu"),
 				Timeout:     timeout,
 				IdleTimeout: node.GetDuration("idle"),
 

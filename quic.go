@@ -12,6 +12,7 @@ import (
 	"github.com/apernet/hysteria/extras/v2/correctnet"
 	"github.com/apernet/quic-go"
 	"github.com/go-log/log"
+	"github.com/xtaci/tcpraw"
 	"golang.org/x/crypto/blake2s"
 )
 
@@ -80,14 +81,22 @@ func (tr *quicTransporter) Dial(addr string, options ...DialOption) (conn net.Co
 	}
 
 	if !ok {
-		var udpAddr net.Addr
-		udpAddr, err = net.ResolveUDPAddr("udp", addr)
+		var remoteAddr net.Addr
+		if tr.config != nil && tr.config.TCP {
+			remoteAddr, err = net.ResolveTCPAddr("tcp", addr)
+		} else {
+			remoteAddr, err = net.ResolveUDPAddr("udp", addr)
+		}
 		if err != nil {
 			return
 		}
 
 		var pc net.PacketConn
-		pc, err = net.ListenUDP("udp", nil)
+		if tr.config != nil && tr.config.TCP {
+			pc, err = tcpraw.Dial("tcp", addr)
+		} else {
+			pc, err = net.ListenUDP("udp", nil)
+		}
 		if err != nil {
 			return
 		}
@@ -101,7 +110,7 @@ func (tr *quicTransporter) Dial(addr string, options ...DialOption) (conn net.Co
 			}
 		}
 
-		session, err = tr.initSession(udpAddr, pc)
+		session, err = tr.initSession(remoteAddr, pc)
 		if err != nil {
 			pc.Close()
 			return nil, err
@@ -141,6 +150,7 @@ func (tr *quicTransporter) initSession(addr net.Addr, conn net.PacketConn) (*qui
 			quic.Version2,
 		},
 		DisablePathManager: true,
+        DisablePathMTUDiscovery: config.DPMTUD,
 
 		InitialStreamReceiveWindow:     config.ReceiveWindowConn,
 		MaxStreamReceiveWindow:         config.ReceiveWindowConn,
@@ -168,6 +178,7 @@ func (tr *quicTransporter) Multiplex() bool {
 type QUICConfig struct {
 	TLSConfig       *tls.Config
 	Timeout         time.Duration
+	DPMTUD          bool
 	KeepAlive       bool
 	KeepAlivePeriod time.Duration
 	IdleTimeout     time.Duration
@@ -177,6 +188,8 @@ type QUICConfig struct {
 	ReceiveWindowConn uint64
 	ReceiveWindow     uint64
 	MaxConnClient     int64
+
+	TCP bool // Support TCP parameter
 }
 
 const (
@@ -219,6 +232,7 @@ func QUICListener(addr string, config *QUICConfig) (Listener, error) {
 			quic.Version2,
 		},
 		DisablePathManager: true,
+        DisablePathMTUDiscovery: config.DPMTUD,
 
 		InitialStreamReceiveWindow:     config.ReceiveWindowConn,
 		MaxStreamReceiveWindow:         config.ReceiveWindowConn,
@@ -232,14 +246,22 @@ func QUICListener(addr string, config *QUICConfig) (Listener, error) {
 		tlsConfig = DefaultTLSConfig
 	}
 	var conn net.PacketConn
+	var err error
 
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	conn, err = correctnet.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return nil, err
+	if config.TCP {
+		conn, err = tcpraw.Listen("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		udpAddr, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			return nil, err
+		}
+		conn, err = correctnet.ListenUDP("udp", udpAddr)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if config.Key != nil {

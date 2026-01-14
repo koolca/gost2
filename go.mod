@@ -35,7 +35,7 @@ require (
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
 	github.com/xtaci/kcp-go/v5 v5.6.7
 	github.com/xtaci/smux v1.5.24
-	github.com/xtaci/tcpraw v1.2.25
+	github.com/xtaci/tcpraw v1.2.32
 	gitlab.com/yawning/obfs4.git v0.0.0-20220204003609-77af0cba934d
 	golang.org/x/crypto v0.26.0
 	golang.org/x/net v0.28.0
@@ -46,7 +46,7 @@ require (
 	filippo.io/edwards25519 v1.0.0-rc.1.0.20210721174708-390f27c3be20 // indirect
 	github.com/MakeNowJust/heredoc/v2 v2.0.1 // indirect
 	github.com/aead/chacha20 v0.0.0-20180709150244-8b13a72661da // indirect
-	github.com/coreos/go-iptables v0.6.0 // indirect
+	github.com/coreos/go-iptables v0.8.0 // indirect
 	github.com/dchest/siphash v1.2.2 // indirect
 	github.com/go-ini/ini v1.67.0 // indirect
 	github.com/google/btree v1.1.2 // indirect
