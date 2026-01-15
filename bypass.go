@@ -25,12 +25,17 @@ type Matcher interface {
 
 // NewMatcher creates a Matcher for the given pattern.
 // The acutal Matcher depends on the pattern:
+// Port Matcher if pattern is a valid port number.
 // IP Matcher if pattern is a valid IP address.
 // CIDR Matcher if pattern is a valid CIDR address.
 // Domain Matcher if both of the above are not.
 func NewMatcher(pattern string) Matcher {
 	if pattern == "" {
 		return nil
+	}
+	// Try Port Matcher first (pure number)
+	if port, err := strconv.Atoi(pattern); err == nil {
+		return PortMatcher(port)
 	}
 	if ip := net.ParseIP(pattern); ip != nil {
 		return IPMatcher(ip)
@@ -90,15 +95,22 @@ type domainMatcher struct {
 	glob    glob.Glob
 }
 
-// DomainMatcher creates a Matcher for a specific domain pattern,
-// the pattern can be a plain domain such as 'example.com',
-// a wildcard such as '*.exmaple.com' or a special wildcard '.example.com'.
+// DomainMatcher creates a Matcher for a specific domain pattern.
+// It automatically handles subdomains for plain domains.
+// e.g., "baidu.com" will match "baidu.com" AND "*.baidu.com".
 func DomainMatcher(pattern string) Matcher {
 	p := pattern
+	// If it starts with '.', it's an explicit suffix wildcard request (old style)
 	if strings.HasPrefix(pattern, ".") {
 		p = pattern[1:] // trim the prefix '.'
-		pattern = "*" + p
+		pattern = "*" + pattern
+	} else if !strings.Contains(pattern, "*") {
+		// If it's a plain domain (no wildcards), we want it to match subdomains automatically.
+		// We set the glob pattern to "*.domain".
+		// The exact match "domain" is handled by the 'p' variable in Match().
+		pattern = "*." + p
 	}
+
 	return &domainMatcher{
 		pattern: p,
 		glob:    glob.MustCompile(pattern),
@@ -110,14 +122,43 @@ func (m *domainMatcher) Match(domain string) bool {
 		return false
 	}
 
+	// 1. Exact match (e.g. "baidu.com")
 	if domain == m.pattern {
 		return true
 	}
+	// 2. Glob match (e.g. "www.baidu.com" matches "*.baidu.com")
 	return m.glob.Match(domain)
 }
 
 func (m *domainMatcher) String() string {
 	return "domain " + m.pattern
+}
+
+type portMatcher struct {
+	port int
+}
+
+// PortMatcher creates a Matcher for a specific port.
+func PortMatcher(port int) Matcher {
+	return &portMatcher{
+		port: port,
+	}
+}
+
+func (m *portMatcher) Match(addr string) bool {
+	if m == nil {
+		return false
+	}
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	p, _ := strconv.Atoi(portStr)
+	return p == m.port
+}
+
+func (m *portMatcher) String() string {
+	return fmt.Sprintf("port %d", m.port)
 }
 
 // Bypass is a filter for address (IP or domain).
@@ -164,10 +205,11 @@ func (bp *Bypass) Contains(addr string) bool {
 		return false
 	}
 
-	// try to strip the port
-	if host, port, _ := net.SplitHostPort(addr); host != "" && port != "" {
+	// Prepare the host part for IP/Domain matchers.
+	host := addr
+	if h, port, _ := net.SplitHostPort(addr); h != "" && port != "" {
 		if p, _ := strconv.Atoi(port); p > 0 { // port is valid
-			addr = host
+			host = h
 		}
 	}
 
@@ -185,21 +227,25 @@ func (bp *Bypass) Contains(addr string) bool {
 		return result.(bool)
 	}
 
-	isIP := net.ParseIP(addr) != nil
+	isIP := net.ParseIP(host) != nil
 	var resolvedAddr string
 	var matched, resolveFailed bool
+
 	for _, matcher := range bp.matchers {
 		if matcher == nil {
 			continue
 		}
-		if _, ok := matcher.(*domainMatcher); ok || isIP {
+
+		if _, ok := matcher.(*portMatcher); ok {
 			matched = matcher.Match(addr)
+		} else if _, ok := matcher.(*domainMatcher); ok || isIP {
+			matched = matcher.Match(host)
 		} else if bp.resolve && !resolveFailed {
 			if resolvedAddr == "" {
-				ipAddr, err := net.ResolveIPAddr("ip", addr)
+				ipAddr, err := net.ResolveIPAddr("ip", host)
 				if err != nil {
 					resolveFailed = true
-					log.Logf("[bypass] resolve %s : %s", addr, err)
+					log.Logf("[bypass] resolve %s : %s", host, err)
 					continue
 				}
 				resolvedAddr = ipAddr.String()
