@@ -702,6 +702,8 @@ func (r *route) GenRouters() ([]router, error) {
 			gost.NodeHandlerOption(node),
 			gost.IPsHandlerOption(ips),
 			gost.TCPModeHandlerOption(node.GetBool("tcp")),
+			gost.KeepAliveHandlerOption(node.GetBool("keepalive")),
+			gost.TTLHandlerOption(node.GetDuration("ttl")),
 			gost.IPRoutesHandlerOption(tunRoutes...),
 			gost.ProxyAgentHandlerOption(node.Get("proxyAgent")),
 			gost.HTTPTunnelHandlerOption(node.GetBool("httpTunnel")),

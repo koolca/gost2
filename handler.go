@@ -41,6 +41,8 @@ type HandlerOptions struct {
 	Host          string
 	IPs           []string
 	TCPMode       bool
+	KeepAlive     bool
+	TTL           time.Duration
 	IPRoutes      []IPRoute
 	ProxyAgent    string
 	HTTPTunnel    bool
@@ -203,6 +205,18 @@ func IPsHandlerOption(ips []string) HandlerOption {
 func TCPModeHandlerOption(b bool) HandlerOption {
 	return func(opts *HandlerOptions) {
 		opts.TCPMode = b
+	}
+}
+
+func KeepAliveHandlerOption(b bool) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.KeepAlive = b
+	}
+}
+
+func TTLHandlerOption(d time.Duration) HandlerOption {
+	return func(opts *HandlerOptions) {
+		opts.TTL = d
 	}
 }
 

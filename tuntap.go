@@ -7,17 +7,19 @@ import (
 	"io"
 	"net"
 	"os"
+    "strings"
+	"sync/atomic"
 	"sync"
 	"time"
 
 	"github.com/go-log/log"
 	"github.com/shadowsocks/go-shadowsocks2/core"
 	"github.com/shadowsocks/go-shadowsocks2/shadowaead"
-	"github.com/songgao/water"
-	"github.com/songgao/water/waterutil"
+	"github.com/songgao/water/waterutil" // 这里保留 waterutil 用于解析包头，因为它纯粹是工具函数，不涉及设备I/O
 	"github.com/xtaci/tcpraw"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+	"golang.zx2c4.com/wireguard/tun"
 )
 
 var mIPProts = map[waterutil.IPProtocol]string{
@@ -85,9 +87,8 @@ func TunListener(cfg TunConfig) (Listener, error) {
 		}
 		ln.addr = conn.LocalAddr()
 
-		addrs, _ := ifce.Addrs()
-		log.Logf("[tun] %s: name: %s, mtu: %d, addrs: %s",
-			conn.LocalAddr(), ifce.Name, ifce.MTU, addrs)
+		log.Logf("[tun] %s: name: %s, mtu: %d",
+			conn.LocalAddr(), ifce.Name, ifce.MTU)
 
 		ln.conns <- conn
 	}
@@ -254,160 +255,296 @@ func (h *tunHandler) findRouteFor(dst net.IP) net.Addr {
 	return nil
 }
 
+// 检查是否是不可恢复的致命错误 (Socket文件被关闭)
+func isFatalError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// 1. 显式检查 net.ErrClosed
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	// 2. 检查 io.EOF (对于 PacketConn 通常不应该出现，但为了安全)
+	if err == io.EOF {
+		return true
+	}
+	// 3. 字符串兜底检查
+	// "use of closed network connection" 是 Go 标准库关闭 Socket 的报错
+	msg := err.Error()
+	if strings.Contains(msg, "closed network connection") {
+		return true
+	}
+	return false
+}
+
 func (h *tunHandler) transportTun(tun net.Conn, conn net.PacketConn, raddr net.Addr) error {
+	// 用于通知所有协程退出的通道
+	// 只有当 tun 设备读写失败（致命）或 DPD 检测到死链时，才关闭此通道
+	exitCh := make(chan struct{})
+	var exitOnce sync.Once
+
+	// 统一退出函数
+	doExit := func() {
+		exitOnce.Do(func() {
+			close(exitCh)
+		})
+	}
+
+	// DPD 配置
+	//const (
+	//	keepAliveInterval   = 15 * time.Second
+	//	maxMissedKeepAlives = 3
+	//)
+	var missedKeepAlives int32 = 0
+
+	// 错误通道 (仅接收导致重连的错误)
 	errc := make(chan error, 1)
 
+	// ---------------------------------------------------------
+	// 协程 1: Keepalive Sender (Client Only)
+	// ---------------------------------------------------------
 	go func() {
+        if !h.options.KeepAlive {
+            return
+        }
+		keepAliveInterval := h.options.TTL
+		if keepAliveInterval == 0 {
+			keepAliveInterval = 10 * time.Second
+		}
+		maxMissedKeepAlives := int32(h.options.MaxFails)
+		if maxMissedKeepAlives < 3 {
+			maxMissedKeepAlives = 3
+		}
+		ticker := time.NewTicker(keepAliveInterval)
+		defer ticker.Stop()
+
 		for {
+			select {
+			case <-exitCh:
+				return
+			case <-ticker.C:
+				if raddr != nil {
+					// DPD Check
+					missed := atomic.AddInt32(&missedKeepAlives, 1)
+					if missed > maxMissedKeepAlives {
+						log.Logf("[tun] dead peer detected: no response for %d keepalives", missed)
+						errc <- errors.New("dead peer detected")
+						doExit()
+						return
+					}
+
+					// 发送心跳
+					_, err := conn.WriteTo(nil, raddr)
+					if err != nil {
+						// 如果是 Socket 关闭，退出；否则忽略错误
+						if isFatalError(err) {
+							return
+						}
+						// 记录日志但不退出
+						if Debug {
+							log.Logf("[tun] keepalive write error (ignored): %v", err)
+						}
+					} else {
+						if Debug {
+							log.Logf("[tun] sent keepalive (missed: %d)", missed)
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	// ---------------------------------------------------------
+	// 协程 2: TUN -> Network (Read Path)
+	// ---------------------------------------------------------
+	go func() {
+		defer doExit() // TUN 读失败通常意味着网卡没了，必须退出
+
+		for {
+			// 检查是否已被通知退出
+			select {
+			case <-exitCh:
+				return
+			default:
+			}
+
 			err := func() error {
 				_b := sPool.Get().(*[]byte)
 				defer sPool.Put(_b)
 				b := *_b
 
+				// 1. 读 TUN (这里出错是致命的)
 				n, err := tun.Read(b)
 				if err != nil {
-					select {
-					case h.chExit <- struct{}{}:
-					default:
-					}
 					return err
 				}
 
-				var src, dst net.IP
-				if waterutil.IsIPv4(b[:n]) {
-					header, err := ipv4.ParseHeader(b[:n])
+				// 准备数据包
+				// Zero-Copy 优化：数据位于 b[16:]
+				// 注意：这里 b 的切片操作要小心，Read 已经填充了 b[16:16+n]
+				packet := b[wireguardOffset : wireguardOffset+n]
+
+				// Client 发送逻辑
+				if raddr != nil {
+					_, err := conn.WriteTo(packet, raddr)
 					if err != nil {
-						log.Logf("[tun] %s: %v", tun.LocalAddr(), err)
+						// 【核心修改】忽略所有非致命网络错误
+						if isFatalError(err) {
+							return err
+						}
+						// 仅仅记录日志，为了不刷屏，可以只在 Debug 开启时记录
+						// 这里 return nil 表示“本次包处理完毕”，继续循环
 						return nil
 					}
-					if Debug {
-						log.Logf("[tun] %s -> %s %-4s %d/%-4d %-4x %d",
-							header.Src, header.Dst, ipProtocol(waterutil.IPv4Protocol(b[:n])),
-							header.Len, header.TotalLen, header.ID, header.Flags)
-					}
-					src, dst = header.Src, header.Dst
-				} else if waterutil.IsIPv6(b[:n]) {
-					header, err := ipv6.ParseHeader(b[:n])
-					if err != nil {
-						log.Logf("[tun] %s: %v", tun.LocalAddr(), err)
-						return nil
-					}
-					if Debug {
-						log.Logf("[tun] %s -> %s %s %d %d",
-							header.Src, header.Dst,
-							ipProtocol(waterutil.IPProtocol(header.NextHeader)),
-							header.PayloadLen, header.TrafficClass)
-					}
-					src, dst = header.Src, header.Dst
-				} else {
-					log.Logf("[tun] unknown packet")
 					return nil
 				}
 
-				// client side, deliver packet directly.
-				if raddr != nil {
-					_, err := conn.WriteTo(b[:n], raddr)
-					return err
+				// Server 转发逻辑
+				var dst net.IP
+				if waterutil.IsIPv4(packet) {
+					header, _ := ipv4.ParseHeader(packet)
+					dst = header.Dst
+				} else if waterutil.IsIPv6(packet) {
+					header, _ := ipv6.ParseHeader(packet)
+					dst = header.Dst
 				}
 
 				addr := h.findRouteFor(dst)
 				if addr == nil {
-					log.Logf("[tun] no route for %s -> %s", src, dst)
-					return nil
+					return nil // 丢弃无路由包
 				}
 
-				if Debug {
-					log.Logf("[tun] find route: %s -> %s", dst, addr)
-				}
-				if _, err := conn.WriteTo(b[:n], addr); err != nil {
-					return err
+				if _, err := conn.WriteTo(packet, addr); err != nil {
+					// 【核心修改】忽略转发错误
+					if isFatalError(err) {
+						return err
+					}
+					return nil
 				}
 				return nil
 			}()
 
 			if err != nil {
+				// 只有 TUN 错误或 Socket Closed 才会走到这里
 				errc <- err
 				return
 			}
 		}
 	}()
 
+    // ---------------------------------------------------------
+	// 协程 3: Network -> TUN (Write Path)
+	// ---------------------------------------------------------
 	go func() {
+		defer doExit()
+
 		for {
+			select {
+			case <-exitCh:
+				return
+			default:
+			}
+
 			err := func() error {
 				_b := sPool.Get().(*[]byte)
 				defer sPool.Put(_b)
 				b := *_b
 
-				n, addr, err := conn.ReadFrom(b)
-				if err != nil &&
-					err != shadowaead.ErrShortPacket {
-					return err
-				}
+				// 1. 读取网络 (ReadFrom)
+				//start := wireguardOffset
+                //end := cap(b)
+				//end := start + 1420//h.options.MTU
+				//if end > cap(b) {
+				//	end = cap(b)
+				//}
+				//buffToRead := b[start:end]
+                buffToRead := b[wireguardOffset:cap(b)]
+				n, addr, err := conn.ReadFrom(buffToRead)
 
-				var src, dst net.IP
-				if waterutil.IsIPv4(b[:n]) {
-					header, err := ipv4.ParseHeader(b[:n])
-					if err != nil {
-						log.Logf("[tun] %s: %v", tun.LocalAddr(), err)
-						return nil
+				if err != nil {
+					// 【核心修改】处理 Connection Refused
+					if !isFatalError(err) {
+						// 在 Server 重启期间，可能会疯狂收到 Connection Refused
+						// 加一个小睡眠防止 CPU 100%
+						time.Sleep(50 * time.Millisecond)
+						if Debug {
+							// log.Logf("[tun] network read error (ignored): %v", err)
+						}
+						return nil // 继续循环
 					}
-					if Debug {
-						log.Logf("[tun] %s -> %s %-4s %d/%-4d %-4x %d",
-							header.Src, header.Dst, ipProtocol(waterutil.IPv4Protocol(b[:n])),
-							header.Len, header.TotalLen, header.ID, header.Flags)
+
+					// 过滤 Shadowsocks 短包错误
+					if err != shadowaead.ErrShortPacket {
+						return err
 					}
-					src, dst = header.Src, header.Dst
-				} else if waterutil.IsIPv6(b[:n]) {
-					header, err := ipv6.ParseHeader(b[:n])
-					if err != nil {
-						log.Logf("[tun] %s: %v", tun.LocalAddr(), err)
-						return nil
-					}
-					if Debug {
-						log.Logf("[tun] %s -> %s %s %d %d",
-							header.Src, header.Dst,
-							ipProtocol(waterutil.IPProtocol(header.NextHeader)),
-							header.PayloadLen, header.TrafficClass)
-					}
-					src, dst = header.Src, header.Dst
-				} else {
-					log.Logf("[tun] unknown packet")
 					return nil
 				}
 
-				// client side, deliver packet to tun device.
+				// 收到包，重置 DPD
 				if raddr != nil {
-					_, err := tun.Write(b[:n])
-					return err
+					atomic.StoreInt32(&missedKeepAlives, 0)
 				}
 
-				rkey := ipToTunRouteKey(src)
-				if actual, loaded := h.routes.LoadOrStore(rkey, addr); loaded {
-					if actual.(net.Addr).String() != addr.String() {
-						log.Logf("[tun] update route: %s -> %s (old %s)",
-							src, addr, actual.(net.Addr))
+				// 处理 Keepalive
+				if n == 0 {
+					if Debug {
+						log.Logf("[tun] keepalive from %s", addr)
+					}
+					if raddr == nil {
+						// Server 回应
+						conn.WriteTo(nil, addr)
+					}
+					return nil
+				}
+
+				// 写入 TUN
+				fullPacket := b[:wireguardOffset+n]
+
+				// 路由学习 (Server)
+				if raddr == nil {
+					packet := buffToRead[:n]
+					var src net.IP
+					if waterutil.IsIPv4(packet) {
+						header, _ := ipv4.ParseHeader(packet)
+						src = header.Src
+					} else if waterutil.IsIPv6(packet) {
+						header, _ := ipv6.ParseHeader(packet)
+						src = header.Src
+					}
+					if src != nil {
+						rkey := ipToTunRouteKey(src)
 						h.routes.Store(rkey, addr)
 					}
-				} else {
-					log.Logf("[tun] new route: %s -> %s", src, addr)
 				}
 
-				if addr := h.findRouteFor(dst); addr != nil {
-					if Debug {
-						log.Logf("[tun] find route: %s -> %s", dst, addr)
-					}
-					_, err := conn.WriteTo(b[:n], addr)
+				// 写入
+				if _, err := tun.Write(fullPacket); err != nil {
+					// TUN 写失败通常也是致命的
 					return err
 				}
 
-				if _, err := tun.Write(b[:n]); err != nil {
-					select {
-					case h.chExit <- struct{}{}:
-					default:
+				// 如果是 Server 且需要内部转发 (路由到其他 Peer)
+				// 这里的逻辑稍微复杂，如果是 Server 模式，
+				// 我们已经写入了 TUN (让内核处理)，通常内核会根据路由表再发回 TUN (Read Path)
+				// 或者 gost 内部维护了 Peer 路由。
+				// 原有代码有内部转发逻辑，这里补上：
+				if raddr == nil {
+					packet := buffToRead[:n]
+					var dst net.IP
+					if waterutil.IsIPv4(packet) {
+						header, _ := ipv4.ParseHeader(packet)
+						dst = header.Dst
+					} else if waterutil.IsIPv6(packet) {
+						header, _ := ipv6.ParseHeader(packet)
+						dst = header.Dst
 					}
-					return err
+					if targetAddr := h.findRouteFor(dst); targetAddr != nil {
+						// 转发给另一个 client
+						conn.WriteTo(packet, targetAddr)
+						// 忽略发送错误
+					}
 				}
+
 				return nil
 			}()
 
@@ -418,11 +555,16 @@ func (h *tunHandler) transportTun(tun net.Conn, conn net.PacketConn, raddr net.A
 		}
 	}()
 
-	err := <-errc
-	if err != nil && err == io.EOF {
-		err = nil
+	// 等待退出
+	<-exitCh
+
+	// 尝试读取错误原因 (如果有)
+	select {
+	case err := <-errc:
+		return err
+	default:
+		return nil
 	}
-	return err
 }
 
 var mEtherTypes = map[waterutil.Ethertype]string{
@@ -478,9 +620,8 @@ func TapListener(cfg TapConfig) (Listener, error) {
 		}
 		ln.addr = conn.LocalAddr()
 
-		addrs, _ := ifce.Addrs()
-		log.Logf("[tap] %s: name: %s, mac: %s, mtu: %d, addrs: %s",
-			conn.LocalAddr(), ifce.Name, ifce.HardwareAddr, ifce.MTU, addrs)
+		log.Logf("[tap] %s: name: %s, mac: %s, mtu: %d",
+			conn.LocalAddr(), ifce.Name, ifce.HardwareAddr, ifce.MTU)
 
 		ln.conns <- conn
 	}
@@ -776,44 +917,86 @@ func (h *tapHandler) transportTap(tap net.Conn, conn net.PacketConn, raddr net.A
 	return err
 }
 
+// 头部预留长度 (VirtIO Net Header 占用)
+//const wireguardOffset = 10
+
 type tunTapConn struct {
-	ifce *water.Interface
+	dev  tun.Device
 	addr net.Addr
 }
 
+// Read 方法：TUN -> Network
+// 优化策略：直接读取到 b[16:]，不进行内存移动。
+// 【注意】：这打破了 io.Reader 的常规语义（数据通常从 b[0] 开始），
+// 但为了极致性能，我们需要调用者配合处理偏移量。
 func (c *tunTapConn) Read(b []byte) (n int, err error) {
-	return c.ifce.Read(b)
+	// 1. 确保容量足够
+	if cap(b) < wireguardOffset {
+		return 0, io.ErrShortBuffer
+	}
+
+	// 2. 将 b 扩展到最大容量
+	// 我们把数据读到 buff 的 [16 : cap] 区间
+	buff := b[:cap(b)]
+
+	bufs := [][]byte{buff}
+	sizes := []int{0}
+
+	// 3. 调用 WireGuard Read
+	// offset=16。内核头写入 0-16，IP 数据写入 16-end
+	count, err := c.dev.Read(bufs, sizes, wireguardOffset)
+	if err != nil {
+		return 0, err
+	}
+	if count == 0 {
+		return 0, nil
+	}
+
+	// 返回读取到的数据长度 (不含头)
+	// 调用者必须知道数据实际位于 b[16 : 16+n]
+	return sizes[0], nil
 }
 
+// Write 方法：Network -> TUN
+// 优化策略：假设调用者已经把数据放在了 b[16:]，且 b[0:16] 是可写的头部空间。
+// Write 方法：Network -> TUN
 func (c *tunTapConn) Write(b []byte) (n int, err error) {
-	return c.ifce.Write(b)
+	// 1. 检查长度
+	if len(b) < wireguardOffset {
+		return 0, nil
+	}
+
+	// 2. 【必须】头部清零 (解决脏数据导致的 GSO 错误)
+	// 我们利用 Go 切片的特性，只清除前 10 字节。
+	// 编译器会将此优化为高效的 memclr 指令，开销极低。
+    if wireguardOffset > 0 {
+        header := b[:wireguardOffset]
+        for i := range header {
+            header[i] = 0
+        }
+    }
+
+	// 3. 构造参数 (Zero-Copy)
+	bufs := [][]byte{b}
+
+	// 4. 调用 WireGuard Write
+	// offset=10。告诉驱动：数据从下标 10 开始。
+	count, err := c.dev.Write(bufs, wireguardOffset)
+	if err != nil {
+		return 0, err
+	}
+	if count == 0 {
+		return 0, io.ErrShortWrite
+	}
+
+	return len(b) - wireguardOffset, nil
 }
 
-func (c *tunTapConn) Close() (err error) {
-	return c.ifce.Close()
-}
-
-func (c *tunTapConn) LocalAddr() net.Addr {
-	return c.addr
-}
-
-func (c *tunTapConn) RemoteAddr() net.Addr {
-	return &net.IPAddr{}
-}
-
-func (c *tunTapConn) SetDeadline(t time.Time) error {
-	return &net.OpError{Op: "set", Net: "tuntap", Source: nil, Addr: nil, Err: errors.New("deadline not supported")}
-}
-
-func (c *tunTapConn) SetReadDeadline(t time.Time) error {
-	return &net.OpError{Op: "set", Net: "tuntap", Source: nil, Addr: nil, Err: errors.New("deadline not supported")}
-}
-
-func (c *tunTapConn) SetWriteDeadline(t time.Time) error {
-	return &net.OpError{Op: "set", Net: "tuntap", Source: nil, Addr: nil, Err: errors.New("deadline not supported")}
-}
-
-// IsIPv6Multicast reports whether the address addr is an IPv6 multicast address.
-func IsIPv6Multicast(addr net.HardwareAddr) bool {
-	return addr[0] == 0x33 && addr[1] == 0x33
-}
+// 其他方法保持不变...
+func (c *tunTapConn) Close() (err error) { return c.dev.Close() }
+func (c *tunTapConn) LocalAddr() net.Addr { return c.addr }
+func (c *tunTapConn) RemoteAddr() net.Addr { return &net.IPAddr{} }
+func (c *tunTapConn) SetDeadline(t time.Time) error { return &net.OpError{Op: "set", Net: "tuntap", Source: nil, Addr: nil, Err: errors.New("deadline not supported")} }
+func (c *tunTapConn) SetReadDeadline(t time.Time) error { return &net.OpError{Op: "set", Net: "tuntap", Source: nil, Addr: nil, Err: errors.New("deadline not supported")} }
+func (c *tunTapConn) SetWriteDeadline(t time.Time) error { return &net.OpError{Op: "set", Net: "tuntap", Source: nil, Addr: nil, Err: errors.New("deadline not supported")} }
+func IsIPv6Multicast(addr net.HardwareAddr) bool { return addr[0] == 0x33 && addr[1] == 0x33 }

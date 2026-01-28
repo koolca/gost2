@@ -1,14 +1,17 @@
 package gost
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
 	"strings"
 
 	"github.com/go-log/log"
-	"github.com/songgao/water"
+	"golang.zx2c4.com/wireguard/tun"
 )
+
+const wireguardOffset = 0
 
 func createTun(cfg TunConfig) (conn net.Conn, itf *net.Interface, err error) {
 	ip, ipNet, err := net.ParseCIDR(cfg.Addr)
@@ -16,84 +19,59 @@ func createTun(cfg TunConfig) (conn net.Conn, itf *net.Interface, err error) {
 		return
 	}
 
-	ifce, err := water.New(water.Config{
-		DeviceType: water.TUN,
-		PlatformSpecificParams: water.PlatformSpecificParams{
-			ComponentID:   "tap0901",
-			InterfaceName: cfg.Name,
-			Network:       cfg.Addr,
-		},
-	})
+	mtu := cfg.MTU
+	if mtu <= 0 {
+		mtu = DefaultMTU
+	}
+
+	// WireGuard 在 Windows 上使用 Wintun 驱动
+	// 它不需要像 TAP-Windows 那样指定 ComponentID
+	dev, err := tun.CreateTUN(cfg.Name, mtu)
 	if err != nil {
 		return
 	}
 
+	realName, err := dev.Name()
+	if err != nil {
+		dev.Close()
+		return
+	}
+
+	// 配置 Wintun 接口的 IP 地址
+	// 注意：Wintun 接口创建后通常是 "Up" 状态，但需要 IP 配置
 	cmd := fmt.Sprintf("netsh interface ip set address name=\"%s\" "+
 		"source=static addr=%s mask=%s gateway=none",
-		ifce.Name(), ip.String(), ipMask(ipNet.Mask))
+		realName, ip.String(), ipMask(ipNet.Mask))
 	log.Log("[tun]", cmd)
 	args := strings.Split(cmd, " ")
 	if er := exec.Command(args[0], args[1:]...).Run(); er != nil {
+		dev.Close()
 		err = fmt.Errorf("%s: %v", cmd, er)
 		return
 	}
 
-	if err = addTunRoutes(ifce.Name(), cfg.Gateway, cfg.Routes...); err != nil {
+	if err = addTunRoutes(realName, cfg.Gateway, cfg.Routes...); err != nil {
+		dev.Close()
 		return
 	}
 
-	itf, err = net.InterfaceByName(ifce.Name())
+	itf, err = net.InterfaceByName(realName)
 	if err != nil {
+		dev.Close()
 		return
 	}
 
 	conn = &tunTapConn{
-		ifce: ifce,
+		dev:  dev,
 		addr: &net.IPAddr{IP: ip},
 	}
 	return
 }
 
 func createTap(cfg TapConfig) (conn net.Conn, itf *net.Interface, err error) {
-	ip, ipNet, _ := net.ParseCIDR(cfg.Addr)
-
-	ifce, err := water.New(water.Config{
-		DeviceType: water.TAP,
-		PlatformSpecificParams: water.PlatformSpecificParams{
-			ComponentID:   "tap0901",
-			InterfaceName: cfg.Name,
-			Network:       cfg.Addr,
-		},
-	})
-	if err != nil {
-		return
-	}
-
-	if ip != nil && ipNet != nil {
-		cmd := fmt.Sprintf("netsh interface ip set address name=\"%s\" "+
-			"source=static addr=%s mask=%s gateway=none",
-			ifce.Name(), ip.String(), ipMask(ipNet.Mask))
-		log.Log("[tap]", cmd)
-		args := strings.Split(cmd, " ")
-		if er := exec.Command(args[0], args[1:]...).Run(); er != nil {
-			err = fmt.Errorf("%s: %v", cmd, er)
-			return
-		}
-	}
-
-	if err = addTapRoutes(ifce.Name(), cfg.Gateway, cfg.Routes...); err != nil {
-		return
-	}
-
-	itf, err = net.InterfaceByName(ifce.Name())
-	if err != nil {
-		return
-	}
-
-	conn = &tunTapConn{
-		ifce: ifce,
-		addr: &net.IPAddr{IP: ip},
-	}
+	// wireguard-go 的 Windows 实现基于 Wintun (Layer 3 TUN)。
+	// 它不支持传统的 TAP (Layer 2) 模式。
+	err = errors.New("tap is not supported on windows via wireguard-go (wintun only supports layer 3)")
 	return
 }
 
@@ -120,25 +98,7 @@ func addTunRoutes(ifName string, gw string, routes ...IPRoute) error {
 }
 
 func addTapRoutes(ifName string, gw string, routes ...string) error {
-	for _, route := range routes {
-		if route == "" {
-			continue
-		}
-
-		deleteRoute(ifName, route)
-
-		cmd := fmt.Sprintf("netsh interface ip add route prefix=%s interface=\"%s\" store=active",
-			route, ifName)
-		if gw != "" {
-			cmd += " nexthop=" + gw
-		}
-		log.Logf("[tap] %s", cmd)
-		args := strings.Split(cmd, " ")
-		if er := exec.Command(args[0], args[1:]...).Run(); er != nil {
-			return fmt.Errorf("%s: %v", cmd, er)
-		}
-	}
-	return nil
+	return errors.New("tap routes not supported")
 }
 
 func deleteRoute(ifName string, route string) error {

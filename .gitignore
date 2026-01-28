@@ -33,4 +33,6 @@ _testmain.go
 *.bak
 
 .vscode/
+.bak/
 cmd/gost/gost
+cmd/gost/gost.exe
