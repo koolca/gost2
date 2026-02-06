@@ -74,6 +74,8 @@ github.com/klauspost/cpuid/v2 v2.2.6 h1:ndNyv040zDGIDh8thGkXYjnFtiN02M1PVVF+JE/4
 github.com/klauspost/cpuid/v2 v2.2.6/go.mod h1:Lcz8mBdAVJIBVzewtcLocK12l3Y+JytZYpaMropDUws=
 github.com/klauspost/reedsolomon v1.12.0 h1:I5FEp3xSwVCcEh3F5A7dofEfhXdF/bWhQWPH+XwBFno=
 github.com/klauspost/reedsolomon v1.12.0/go.mod h1:EPLZJeh4l27pUGC3aXOjheaoh1I9yut7xTURiW3LQ9Y=
+github.com/koolca/tcpraw v0.0.0-20260204075722-a0816c10805d h1:0YzLYaEFQtH47gxvHkZs9212Xv+kb3alpVqQ7zNFzQA=
+github.com/koolca/tcpraw v0.0.0-20260204075722-a0816c10805d/go.mod h1:D2934PQEqknT1iPhprdvpQ94x9pDO3zXQmZR/el+xMY=
 github.com/lqqyt2423/go-mitmproxy v1.8.5 h1:F/Jt+Z5+LkJVMvjbRNtovCt6EuPArnumSOcRK9ImU7Q=
 github.com/lqqyt2423/go-mitmproxy v1.8.5/go.mod h1:dSGnI17tVZ8dtYu9vnaIz7kxVwJNFH0CoNQwEQlTpxE=
 github.com/lunixbochs/struc v0.0.0-20200707160740-784aaebc1d40 h1:EnfXoSqDfSNJv0VBNqY/88RNnhSGYkrHaO0mmFGbVsc=
@@ -123,8 +125,6 @@ github.com/xtaci/lossyconn v0.0.0-20200209145036-adba10fffc37 h1:EWU6Pktpas0n8lL
 github.com/xtaci/lossyconn v0.0.0-20200209145036-adba10fffc37/go.mod h1:HpMP7DB2CyokmAh4lp0EQnnWhmycP/TvwBGzvuie+H0=
 github.com/xtaci/smux v1.5.24 h1:77emW9dtnOxxOQ5ltR+8BbsX1kzcOxQ5gB+aaV9hXOY=
 github.com/xtaci/smux v1.5.24/go.mod h1:OMlQbT5vcgl2gb49mFkYo6SMf+zP3rcjcwQz7ZU7IGY=
-github.com/xtaci/tcpraw v1.2.32 h1:wdJxd+9IaxGSaPK6luCLIdCkW/8TUQ6Vm872Ctq9L18=
-github.com/xtaci/tcpraw v1.2.32/go.mod h1:D2934PQEqknT1iPhprdvpQ94x9pDO3zXQmZR/el+xMY=
 gitlab.com/yawning/edwards25519-extra.git v0.0.0-20211229043746-2f91fcc9fbdb h1:qRSZHsODmAP5qDvb3YsO7Qnf3TRiVbGxNG/WYnlM4/o=
 gitlab.com/yawning/edwards25519-extra.git v0.0.0-20211229043746-2f91fcc9fbdb/go.mod h1:gvdJuZuO/tPZyhEV8K3Hmoxv/DWud5L4qEQxfYjEUTo=
 gitlab.com/yawning/obfs4.git v0.0.0-20220204003609-77af0cba934d h1:tJ8F7ABaQ3p3wjxwXiWSktVDgjZEXkvaRawd2rIq5ws=
